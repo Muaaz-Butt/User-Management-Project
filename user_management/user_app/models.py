@@ -1,5 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import BaseUserManager, AbstractBaseUser
+from django.utils import timezone
+from django.conf import settings
 
 class MyUserManager(BaseUserManager):
     def create_user(self, email, name, tc, password=None, password2=None):
@@ -68,3 +70,32 @@ class User(AbstractBaseUser):
         "Is the user a member of staff?"
         # Simplest possible answer: All admins are staff
         return self.is_admin
+      
+class LoginAttempt(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    successful = models.BooleanField(default=False)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    is_locked_out = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f'Login attempt by {self.user.email} on {self.timestamp}'
+
+    class Meta:
+        ordering = ['-timestamp']
+
+    @classmethod
+    def get_recent_attempts(cls, user, minutes=30):
+        cutoff_time = timezone.now() - timezone.timedelta(minutes=minutes)
+        return cls.objects.filter(user=user, timestamp__gt=cutoff_time, successful=False)
+
+class LoginSettings(models.Model):
+    max_attempts = models.PositiveIntegerField(default=5)
+    lockout_duration = models.PositiveIntegerField(default=7)  # in minutes
+
+    def __str__(self):
+        return f'Login settings: max attempts: {self.max_attempts}, lockout duration: {self.lockout_duration} minutes'
+
+    @classmethod
+    def get_settings(cls):
+        return cls.objects.first() or cls.objects.create()

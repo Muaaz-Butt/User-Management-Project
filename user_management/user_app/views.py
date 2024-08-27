@@ -10,6 +10,9 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework import generics
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
+from .models import LoginAttempt, LoginSettings
+from .serializers import UserLoginSerializer
+from .utils import get_tokens_for_user
 
 from django.http import HttpResponse
 
@@ -54,6 +57,7 @@ class UserRegistrationView(APIView):
 class UserLoginView(APIView):
     permission_classes = [AllowAny]
     renderer_classes = [UserRenderer]
+
     @swagger_auto_schema(
         request_body=UserLoginSerializer,
         responses={
@@ -73,20 +77,65 @@ class UserLoginView(APIView):
                     })
                 }
             )),
+            403: openapi.Response('Forbidden', openapi.Schema(
+                type=openapi.TYPE_OBJECT,
+                properties={
+                    'errors': openapi.Schema(type=openapi.TYPE_OBJECT, properties={
+                        'non_field_errors': openapi.Schema(type=openapi.TYPE_ARRAY, items=openapi.Items(type=openapi.TYPE_STRING))
+                    })
+                }
+            )),
         }
-    )    
+    )
     def post(self, request, format=None):
         serializer = UserLoginSerializer(data=request.data)
-        if  serializer.is_valid(raise_exception=True):
+        if serializer.is_valid(raise_exception=True):
             email = serializer.data.get('email')
             password = serializer.data.get('password')
-            user = authenticate(email=email, password=password)
-            token = get_tokens_for_user(user)
-            if user is not None :
-                return Response({'token' : token, 'msg' : 'Login Successful'}, status=status.HTTP_200_OK)
+            ip_address = self.get_client_ip(request)
+
+            user = self.get_user(email)
+            if user is None:
+                return Response({'errors': {'non_field_errors': ['Invalid email or password']}}, status=status.HTTP_400_BAD_REQUEST)
+            
+            if self.is_user_locked_out(user):
+                return Response({'errors': {'non_field_errors': ['Account locked. Try again later.']}}, status=status.HTTP_403_FORBIDDEN)
+
+            if user is not None and self.authenticate_user(user, password):
+                return self.login_success(user)
             else:
-                return Response({'errors' : {'non_field_errors' : ['Email or password is not valid']}})
-              
+                return self.login_failure(user, ip_address)
+
+    def get_client_ip(self, request):
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        return x_forwarded_for.split(',')[0] if x_forwarded_for else request.META.get('REMOTE_ADDR')
+
+    def get_user(self, email):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        return User.objects.filter(email=email).first()
+
+    def is_user_locked_out(self, user):
+        settings = LoginSettings.get_settings()
+        recent_attempts = LoginAttempt.get_recent_attempts(user, minutes=settings.lockout_duration)
+        return recent_attempts.count() >= settings.max_attempts
+
+    def authenticate_user(self, user, password):
+        return authenticate(email=user.email, password=password) is not None
+
+    def login_success(self, user):
+        token = get_tokens_for_user(user)
+        LoginAttempt.objects.create(user=user, successful=True, ip_address=self.get_client_ip(self.request))
+        return Response({'token': token, 'msg': 'Login Successful'}, status=status.HTTP_200_OK)
+
+    def login_failure(self, user, ip_address):
+        LoginAttempt.objects.create(user=user, successful=False, ip_address=ip_address)
+        settings = LoginSettings.get_settings()
+        recent_attempts = LoginAttempt.get_recent_attempts(user, minutes=settings.lockout_duration)
+        if recent_attempts.count() >= settings.max_attempts:
+            return Response({'errors': {'non_field_errors': ['Account locked. Try again later.']}}, status=status.HTTP_403_FORBIDDEN)
+        else:
+            return Response({'errors': {'non_field_errors': ['Invalid email or password']}}, status=status.HTTP_400_BAD_REQUEST)
 
 class UserProfileView(APIView):
     renderer_classes = [UserRenderer]
@@ -301,3 +350,5 @@ class UserDeleteView(APIView):
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         
         return Response({"msg": "User account deleted successfully"}, status=status.HTTP_204_NO_CONTENT)
+      
+      
